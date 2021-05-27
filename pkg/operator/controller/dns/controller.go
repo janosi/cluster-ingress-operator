@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/ghodss/yaml"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 
@@ -17,6 +18,7 @@ import (
 	awsdns "github.com/openshift/cluster-ingress-operator/pkg/dns/aws"
 	azuredns "github.com/openshift/cluster-ingress-operator/pkg/dns/azure"
 	gcpdns "github.com/openshift/cluster-ingress-operator/pkg/dns/gcp"
+	ibmdns "github.com/openshift/cluster-ingress-operator/pkg/dns/ibm"
 	logf "github.com/openshift/cluster-ingress-operator/pkg/log"
 	"github.com/openshift/cluster-ingress-operator/pkg/manifests"
 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
@@ -37,6 +39,7 @@ import (
 	operatorv1 "github.com/openshift/api/operator/v1"
 	operatoringressv1 "github.com/openshift/api/operatoringress/v1"
 
+	installtypes "github.com/openshift/installer/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	runtimecontroller "sigs.k8s.io/controller-runtime/pkg/controller"
@@ -230,6 +233,17 @@ func (r *reconciler) createDNSProviderIfNeeded(dnsConfig *configv1.DNS) error {
 		if r.cloudCredentials == nil || !reflect.DeepEqual(creds.Data, r.cloudCredentials.Data) {
 			needUpdate = true
 		}
+	case configv1.IBMCloudPlatformType:
+		if infraConfig.Status.ControlPlaneTopology != configv1.ExternalTopologyMode {
+			name := types.NamespacedName{Namespace: r.config.Namespace, Name: cloudCredentialsSecretName}
+			if err := r.cache.Get(context.TODO(), name, creds); err != nil {
+				return fmt.Errorf("failed to get cloud credentials from secret %s: %v", name, err)
+			}
+
+			if r.cloudCredentials == nil || !reflect.DeepEqual(creds.Data, r.cloudCredentials.Data) {
+				needUpdate = true
+			}
+		}
 	}
 
 	if r.infraConfig == nil || !reflect.DeepEqual(infraConfig.Status, r.infraConfig.Status) {
@@ -237,7 +251,7 @@ func (r *reconciler) createDNSProviderIfNeeded(dnsConfig *configv1.DNS) error {
 	}
 
 	if needUpdate {
-		dnsProvider, err := r.createDNSProvider(dnsConfig, platformStatus, creds)
+		dnsProvider, err := r.createDNSProvider(dnsConfig, platformStatus, &infraConfig.Status, creds)
 		if err != nil {
 			return fmt.Errorf("failed to create DNS provider: %v", err)
 		}
@@ -449,7 +463,7 @@ func (r *reconciler) ToDNSRecords(o client.Object) []reconcile.Request {
 
 // createDNSProvider creates a DNS manager compatible with the given cluster
 // configuration.
-func (r *reconciler) createDNSProvider(dnsConfig *configv1.DNS, platformStatus *configv1.PlatformStatus, creds *corev1.Secret) (dns.Provider, error) {
+func (r *reconciler) createDNSProvider(dnsConfig *configv1.DNS, platformStatus *configv1.PlatformStatus, infraStatus *configv1.InfrastructureStatus, creds *corev1.Secret) (dns.Provider, error) {
 	// If no DNS configuration is provided, don't try to set up provider clients.
 	// TODO: the provider configuration can be refactored into the provider
 	// implementations themselves, so this part of the code won't need to
@@ -559,6 +573,45 @@ func (r *reconciler) createDNSProvider(dnsConfig *configv1.DNS, platformStatus *
 			return nil, fmt.Errorf("failed to create GCP DNS provider: %v", err)
 		}
 		dnsProvider = provider
+	case configv1.IBMCloudPlatformType:
+		if infraStatus.ControlPlaneTopology != configv1.ExternalTopologyMode {
+			clusterConfigName := types.NamespacedName{Namespace: "kube-system", Name: "cluster-config-v1"}
+			clusterConfig := &corev1.ConfigMap{}
+			if err := r.client.Get(context.TODO(), clusterConfigName, clusterConfig); err != nil {
+				return nil, fmt.Errorf("failed to get configmap %s: %v", clusterConfigName, err)
+			}
+
+			installConfigYAML, ok := clusterConfig.Data["install-config"]
+			if !ok {
+				return nil, fmt.Errorf("missing install-config in configmap")
+			}
+			var installConfig installtypes.InstallConfig
+			if err := yaml.Unmarshal([]byte(installConfigYAML), &installConfig); err != nil {
+				return nil, fmt.Errorf("cannot unmarshal install-config yaml")
+			}
+			if installConfig.IBMCloud.CISInstanceCRN == "" {
+				return nil, fmt.Errorf("missing cis instance crn")
+			}
+			zones := []string{}
+			if dnsConfig.Spec.PrivateZone != nil {
+				zones = append(zones, dnsConfig.Spec.PrivateZone.ID)
+			}
+			if dnsConfig.Spec.PublicZone != nil {
+				zones = append(zones, dnsConfig.Spec.PublicZone.ID)
+			}
+			provider, err := ibmdns.NewProvider(ibmdns.Config{
+				APIKey:    string(creds.Data["ibmcloud_api_key"]),
+				CISCRN:    installConfig.IBMCloud.CISInstanceCRN,
+				Zones:     zones,
+				UserAgent: userAgent,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to create IBM DNS manager: %v", err)
+			}
+			dnsProvider = provider
+		} else {
+			dnsProvider = &dns.FakeProvider{}
+		}
 	default:
 		dnsProvider = &dns.FakeProvider{}
 	}

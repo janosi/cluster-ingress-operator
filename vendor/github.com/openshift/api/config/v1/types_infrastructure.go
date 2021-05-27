@@ -105,6 +105,9 @@ const (
 
 	// "SingleReplica" is for operators to avoid spending resources for high-availability purpose.
 	SingleReplicaTopologyMode TopologyMode = "SingleReplica"
+
+	// "External" is for operators to indicate that the master nodes are managed in an external environment
+	ExternalTopologyMode TopologyMode = "External"
 )
 
 // PlatformType is a specific supported infrastructure provider.
